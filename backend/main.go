@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"pos-backend/models" // Sesuaikan dengan nama module Anda
 
@@ -41,15 +42,25 @@ func main() {
 		}
 
 		// 3. Query Insert ke PostgreSQL
-		query := `INSERT INTO products (category_id, name, sku, price, stock) 
-                  VALUES ($1, $2, $3, $4, $5) RETURNING id`
+		// Query Upsert: Jika SKU sudah ada, update datanya. Jika belum, masukkan data baru.
+		query := `
+			INSERT INTO products (category_id, name, sku, price, stock) 
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (sku) 
+			DO UPDATE SET 
+				name = EXCLUDED.name,
+				price = EXCLUDED.price,
+				stock = EXCLUDED.stock,
+				category_id = EXCLUDED.category_id
+			RETURNING id`
 
 		err := conn.QueryRow(context.Background(), query,
 			newProduct.CategoryID, newProduct.Name, newProduct.SKU, newProduct.Price, newProduct.Stock,
 		).Scan(&newProduct.ID)
 
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan data"})
+			// DEBUG: tampilkan error asli untuk identifikasi cepat
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -82,6 +93,84 @@ func main() {
 		}
 
 		c.JSON(http.StatusOK, products)
+	})
+
+	// Transaction untuk kasir (UPDATE stok produk berdasarkan transaksi yang terjadi)
+	r.POST("/transactions", func(c *gin.Context) {
+		var req struct {
+			ProductID int `json:"product_id"`
+			Quantity  int `json:"quantity"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// Gunakan Transaction SQL agar stok tidak "balapan" (Race Condition)
+		tx, _ := conn.Begin(context.Background())
+		defer tx.Rollback(context.Background())
+
+		// 1. Update Stok
+		_, err := tx.Exec(context.Background(),
+			"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1",
+			req.Quantity, req.ProductID)
+
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Stok tidak cukup atau gagal update"})
+			return
+		}
+
+		tx.Commit(context.Background())
+		c.JSON(http.StatusOK, gin.H{"message": "Transaksi Berhasil!"})
+	})
+
+	r.POST("/products/checkout", func(c *gin.Context) {
+		var items []struct {
+			ID       int `json:"id"`
+			Quantity int `json:"quantity"`
+		}
+
+		if err := c.ShouldBindJSON(&items); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Format data salah"})
+			return
+		}
+
+		// Mulai Database Transaction (Atomicity)
+		// Jika satu barang gagal update, semua perubahan akan dibatalkan (rollback)
+		tx, err := conn.Begin(context.Background())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memulai transaksi"})
+			return
+		}
+		defer tx.Rollback(context.Background())
+
+		for _, item := range items {
+			// Query Update Stok: Kurangi stok hanya jika stok cukup (stock >= quantity)
+			result, err := tx.Exec(context.Background(),
+				"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1",
+				item.Quantity, item.ID)
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal update stok"})
+				return
+			}
+
+			// Cek apakah ada baris yang ter-update
+			if result.RowsAffected() == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Stok produk ID %d tidak mencukupi", item.ID)})
+				return
+			}
+		}
+
+		// Commit jika semua lancar
+		err = tx.Commit(context.Background())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan transaksi"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "Transaksi berhasil dan stok telah diperbarui!"})
 	})
 
 	r.Run(":8080") // Jalankan server di port 8080
