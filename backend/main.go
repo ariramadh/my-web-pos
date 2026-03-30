@@ -3,12 +3,66 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"pos-backend/models" // Sesuaikan dengan nama module Anda
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 )
+
+func respondError(c *gin.Context, httpCode, responseCode int, responseMessage string, err error) {
+	if err != nil {
+		log.Printf("%s: %v", responseMessage, err)
+	} else {
+		log.Printf("%s", responseMessage)
+	}
+	c.JSON(httpCode, gin.H{
+		"responseCode":    responseCode,
+		"responseMessage": responseMessage,
+		"data":            nil,
+	})
+}
+
+func respondSuccess(c *gin.Context, responseCode int, responseMessage string, data interface{}) {
+	log.Printf("%s", responseMessage)
+	c.JSON(http.StatusOK, gin.H{
+		"responseCode":    responseCode,
+		"responseMessage": responseMessage,
+		"data":            data,
+	})
+}
+
+func authMiddleware(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == "OPTIONS" {
+			c.Next()
+			return
+		}
+
+		auth := c.GetHeader("Authorization")
+		if auth == "" {
+			respondError(c, http.StatusUnauthorized, 401, "Authorization header wajib", nil)
+			c.Abort()
+			return
+		}
+
+		const bearerPrefix = "Bearer "
+		if len(auth) <= len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
+			respondError(c, http.StatusUnauthorized, 401, "Invalid Authorization scheme", nil)
+			c.Abort()
+			return
+		}
+
+		if auth[len(bearerPrefix):] != token {
+			respondError(c, http.StatusUnauthorized, 401, "Invalid token", nil)
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
 
 func main() {
 	// 1. Koneksi Database
@@ -31,13 +85,21 @@ func main() {
 		c.Next()
 	})
 
+	// Authorization Bearer Token middleware
+	const expectedBearerToken = "your-secret-bearer-token"
+	r.Use(authMiddleware(expectedBearerToken))
+
 	// 2. Endpoint API untuk Tambah Produk
 	r.POST("/products", func(c *gin.Context) {
 		var newProduct models.Product
 
 		// Bind JSON dari request ke struct
 		if err := c.ShouldBindJSON(&newProduct); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"responseCode":    400,
+				"responseMessage": "Format data salah",
+				"data":            nil,
+			})
 			return
 		}
 
@@ -59,15 +121,41 @@ func main() {
 		).Scan(&newProduct.ID)
 
 		if err != nil {
-			// DEBUG: tampilkan error asli untuk identifikasi cepat
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"responseCode":    500,
+				"responseMessage": "Gagal menambahkan produk",
+				"data":            nil,
+			})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Produk berhasil ditambahkan!",
-			"data":    newProduct,
-		})
+		respondSuccess(c, 200, "Sukses", newProduct)
+	})
+
+	r.GET("/products/categories", func(c *gin.Context) {
+		var categories []models.Category
+
+		rows, err := conn.Query(context.Background(), "SELECT id, name FROM categories")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"responseCode":    500,
+				"responseMessage": "Gagal mengambil data kategori",
+				"data":            nil,
+			})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var cat models.Category
+			err := rows.Scan(&cat.ID, &cat.Name)
+			if err != nil {
+				continue
+			}
+			categories = append(categories, cat)
+		}
+
+		respondSuccess(c, 200, "Sukses", categories)
 	})
 
 	// Endpoint API untuk Menampilkan Semua Produk
@@ -77,7 +165,11 @@ func main() {
 		// Query ke Database
 		rows, err := conn.Query(context.Background(), "SELECT id, category_id, name, sku, price, stock FROM products")
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal mengambil data"})
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"responseCode":    500,
+				"responseMessage": "Gagal mengambil data",
+				"data":            nil,
+			})
 			return
 		}
 		defer rows.Close()
@@ -92,7 +184,7 @@ func main() {
 			products = append(products, p)
 		}
 
-		c.JSON(http.StatusOK, products)
+		respondSuccess(c, 200, "Sukses", products)
 	})
 
 	// Transaction untuk kasir (UPDATE stok produk berdasarkan transaksi yang terjadi)
@@ -103,7 +195,11 @@ func main() {
 		}
 
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"responseCode":    400,
+				"responseMessage": "Format data salah",
+				"data":            nil,
+			})
 			return
 		}
 
@@ -117,60 +213,122 @@ func main() {
 			req.Quantity, req.ProductID)
 
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Stok tidak cukup atau gagal update"})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"responseCode":    400,
+				"responseMessage": "Stok tidak cukup atau gagal update",
+				"data":            nil,
+			})
 			return
 		}
 
 		tx.Commit(context.Background())
-		c.JSON(http.StatusOK, gin.H{"message": "Transaksi Berhasil!"})
+		respondSuccess(c, 200, "Sukses", nil)
 	})
 
 	r.POST("/products/checkout", func(c *gin.Context) {
-		var items []struct {
-			ID       int `json:"id"`
-			Quantity int `json:"quantity"`
+		var req struct {
+			InvoiceNum string  `json:"invoice_num"`
+			PaidAmount float64 `json:"paid_amount"`
+			Items      []struct {
+				ID       int `json:"id"`
+				Quantity int `json:"quantity"`
+			} `json:"items"`
 		}
 
-		if err := c.ShouldBindJSON(&items); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Format data salah"})
+		if err := c.ShouldBindJSON(&req); err != nil {
+			respondError(c, http.StatusBadRequest, 400, "Format data salah", err)
+			return
+		}
+
+		if len(req.Items) == 0 {
+			respondError(c, http.StatusBadRequest, 400, "Items tidak boleh kosong", nil)
 			return
 		}
 
 		// Mulai Database Transaction (Atomicity)
-		// Jika satu barang gagal update, semua perubahan akan dibatalkan (rollback)
 		tx, err := conn.Begin(context.Background())
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal memulai transaksi"})
+			respondError(c, http.StatusInternalServerError, 500, "Gagal memulai transaksi", err)
 			return
 		}
 		defer tx.Rollback(context.Background())
 
-		for _, item := range items {
-			// Query Update Stok: Kurangi stok hanya jika stok cukup (stock >= quantity)
+		var totalPrice float64
+		var detailInserts []models.TransactionDetail
+
+		for _, item := range req.Items {
+			var product models.Product
+			if err := tx.QueryRow(context.Background(),
+				"SELECT id, category_id, name, sku, price, stock FROM products WHERE id =$1",
+				item.ID).Scan(&product.ID, &product.CategoryID, &product.Name, &product.SKU, &product.Price, &product.Stock); err != nil {
+				respondError(c, http.StatusBadRequest, 400, fmt.Sprintf("Produk ID %d tidak ditemukan", item.ID), err)
+				return
+			}
+
+			if product.Stock < item.Quantity {
+				respondError(c, http.StatusBadRequest, 400, fmt.Sprintf("Stok produk ID %d tidak mencukupi", item.ID), nil)
+				return
+			}
+
+			subtotal := float64(item.Quantity) * product.Price
+			totalPrice += subtotal
+
 			result, err := tx.Exec(context.Background(),
 				"UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1",
 				item.Quantity, item.ID)
-
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal update stok"})
+				respondError(c, http.StatusInternalServerError, 500, "Gagal update stok", err)
 				return
 			}
 
-			// Cek apakah ada baris yang ter-update
 			if result.RowsAffected() == 0 {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Stok produk ID %d tidak mencukupi", item.ID)})
+				respondError(c, http.StatusBadRequest, 400, fmt.Sprintf("Stok produk ID %d tidak mencukupi", item.ID), nil)
 				return
 			}
+
+			detailInserts = append(detailInserts, models.TransactionDetail{
+				ProductID: product.ID,
+				Qty:       item.Quantity,
+				Subtotal:  subtotal,
+			})
 		}
 
-		// Commit jika semua lancar
-		err = tx.Commit(context.Background())
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal simpan transaksi"})
+		if req.PaidAmount < totalPrice {
+			respondError(c, http.StatusBadRequest, 400, "Nominal bayar kurang dari total harga", nil)
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "Transaksi berhasil dan stok telah diperbarui!"})
+		change := req.PaidAmount - totalPrice
+
+		var transactionID int
+		if err := tx.QueryRow(context.Background(),
+			"INSERT INTO transactions (invoice_num, total_price, total_paid, change_amount) VALUES ($1,$2,$3,$4) RETURNING id",
+			req.InvoiceNum, totalPrice, req.PaidAmount, change).Scan(&transactionID); err != nil {
+			respondError(c, http.StatusInternalServerError, 500, "Gagal menyimpan transaksi", err)
+			return
+		}
+
+		for _, detail := range detailInserts {
+			if _, err := tx.Exec(context.Background(),
+				"INSERT INTO transaction_details (transaction_id, product_id, qty, subtotal) VALUES ($1,$2,$3,$4)",
+				transactionID, detail.ProductID, detail.Qty, detail.Subtotal); err != nil {
+				respondError(c, http.StatusInternalServerError, 500, "Gagal menyimpan detail transaksi", err)
+				return
+			}
+		}
+
+		if err := tx.Commit(context.Background()); err != nil {
+			respondError(c, http.StatusInternalServerError, 500, "Gagal komit transaksi", err)
+			return
+		}
+
+		respondSuccess(c, 200, "Checkout sukses", gin.H{
+			"transaction_id": transactionID,
+			"invoice_num":    req.InvoiceNum,
+			"total_price":    totalPrice,
+			"paid_amount":    req.PaidAmount,
+			"change_amount":  change,
+		})
 	})
 
 	r.Run(":8080") // Jalankan server di port 8080
