@@ -6,6 +6,9 @@ import (
 	"log"
 	"net/http"
 	"pos-backend/models" // Sesuaikan dengan nama module Anda
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -187,6 +190,47 @@ func main() {
 		respondSuccess(c, 200, "Sukses", products)
 	})
 
+	// Endpoint API untuk Menampilkan Produk Low Stock (stock < threshold)
+	r.GET("/products/low-stock", func(c *gin.Context) {
+		var products []models.Product
+
+		threshold := 5
+		if ts := c.Query("threshold"); ts != "" {
+			if parsed, err := strconv.Atoi(ts); err != nil || parsed < 0 {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"responseCode":    400,
+					"responseMessage": "Threshold harus angka positif",
+					"data":            nil,
+				})
+				return
+			} else {
+				threshold = parsed
+			}
+		}
+
+		rows, err := conn.Query(context.Background(), "SELECT id, category_id, name, sku, price, stock FROM products WHERE stock < $1", threshold)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"responseCode":    500,
+				"responseMessage": "Gagal mengambil data low stock",
+				"data":            nil,
+			})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var p models.Product
+			err := rows.Scan(&p.ID, &p.CategoryID, &p.Name, &p.SKU, &p.Price, &p.Stock)
+			if err != nil {
+				continue
+			}
+			products = append(products, p)
+		}
+
+		respondSuccess(c, 200, "Sukses", products)
+	})
+
 	// Transaction untuk kasir (UPDATE stok produk berdasarkan transaksi yang terjadi)
 	r.POST("/transactions", func(c *gin.Context) {
 		var req struct {
@@ -223,6 +267,63 @@ func main() {
 
 		tx.Commit(context.Background())
 		respondSuccess(c, 200, "Sukses", nil)
+	})
+
+	// API Riwayat Transaksi berdasarkan rentang tanggal
+	r.GET("/transactions/history", func(c *gin.Context) {
+		var transactions []models.Transaction
+
+		start := c.Query("start_date")
+		end := c.Query("end_date")
+		query := "SELECT id, invoice_num, total_price, total_paid, change_amount, created_at FROM transactions"
+		params := []interface{}{}
+		where := []string{}
+
+		if start != "" {
+			startTime, err := time.Parse("2006-01-02", start)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"responseCode": 400, "responseMessage": "start_date harus format YYYY-MM-DD", "data": nil})
+				return
+			}
+			where = append(where, fmt.Sprintf("created_at >= $%d", len(params)+1))
+			params = append(params, startTime)
+		}
+
+		if end != "" {
+			endTime, err := time.Parse("2006-01-02", end)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"responseCode": 400, "responseMessage": "end_date harus format YYYY-MM-DD", "data": nil})
+				return
+			}
+			endTime = endTime.Add(24*time.Hour - time.Nanosecond)
+			where = append(where, fmt.Sprintf("created_at <= $%d", len(params)+1))
+			params = append(params, endTime)
+		}
+
+		if len(where) > 0 {
+			query += " WHERE " + strings.Join(where, " AND ")
+		}
+
+		rows, err := conn.Query(context.Background(), query, params...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"responseCode":    500,
+				"responseMessage": "Gagal mengambil history transaksi",
+				"data":            nil,
+			})
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var t models.Transaction
+			if err := rows.Scan(&t.ID, &t.InvoiceNum, &t.TotalPrice, &t.TotalPaid, &t.ChangeAmount, &t.CreatedAt); err != nil {
+				continue
+			}
+			transactions = append(transactions, t)
+		}
+
+		respondSuccess(c, 200, "Sukses", transactions)
 	})
 
 	r.POST("/products/checkout", func(c *gin.Context) {
